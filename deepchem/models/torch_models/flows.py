@@ -1,8 +1,15 @@
 """ This module contains the implementation of the various flow layers and models"""
+from typing import Optional, Tuple, Union, List, Sequence, Any
+
 import numpy as np
+from matplotlib import pyplot as plt
+from tqdm import tqdm
+
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, Union
+from torch.distributions import MultivariateNormal
+
+from deepchem.models.torch_models.torch_model import TorchModel
 
 
 class Flow(nn.Module):
@@ -245,8 +252,10 @@ class MaskedAffineFlow(Flow):
     def __init__(
         self,
         b: torch.Tensor,
-        t: Optional[Union[torch.nn.ModuleList, torch.nn.Sequential]] = None,
-        s: Optional[Union[torch.nn.ModuleList, torch.nn.Sequential]] = None
+        t: Optional[Union[torch.nn.ModuleList, torch.nn.Sequential,
+                          torch.nn.Module]] = None,
+        s: Optional[Union[torch.nn.ModuleList, torch.nn.Sequential,
+                          torch.nn.Module]] = None
     ) -> None:
         """
         Initializes the Masked Affine Flow layer
@@ -255,10 +264,10 @@ class MaskedAffineFlow(Flow):
         ----------
         b: torch.Tensor
             mask for features, i.e. tensor of same size as latent data point filled with 0s and 1s
-        t: Optional[Union[torch.nn.ModuleList, torch.nn.Sequential]], optional
+        t: Optional[Union[torch.nn.ModuleList, torch.nn.Sequential, torch.nn.Module]], optional
             translation mapping, i.e. neural network, where first input dimension is batch dim,
             if None no translation is applied
-        s: Optional[Union[torch.nn.ModuleList, torch.nn.Sequential]], optional
+        s: Optional[Union[torch.nn.ModuleList, torch.nn.Sequential, torch.nn.Module]], optional
             scale mapping, i.e. neural network, where first input dimension is batch dim,
             if None no scale is applied
         """
@@ -534,7 +543,7 @@ class ConstScaleLayer(nn.Module):
         return input * self.scale
 
 
-class MLP_flow(nn.Module):
+class MLPFlow(nn.Module):
     """
     A Multi-Layer Perceptron (MLP) model for normalizing flows that is
     used as a part of a Normalizing Flow model.
@@ -544,11 +553,11 @@ class MLP_flow(nn.Module):
     Example
     -------
     >>> import torch
-    >>> from deepchem.models.torch_models.flows import MLP_flow
+    >>> from deepchem.models.torch_models.flows import MLPFlow
     >>> layers = [2, 4, 4, 2]
-    >>> mlp_flow = MLP_flow(layers)
+    >>> mlpflow = MLPFlow(layers)
     >>> input = torch.tensor([1., 2.])
-    >>> output = mlp_flow(input)
+    >>> output = mlpflow(input)
     >>> output.shape
     torch.Size([2])
     """
@@ -564,7 +573,7 @@ class MLP_flow(nn.Module):
         dropout: Optional[float] = None,
     ):
         """
-        Initializes the MLP_flow model
+        Initializes the MLPFlow model
 
         Parameters
         ----------
@@ -613,7 +622,7 @@ class MLP_flow(nn.Module):
         self.net = nn.Sequential(*net)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the MLP_flow model
+        """Forward pass of the MLPFlow model
 
         Parameters
         ----------
@@ -623,6 +632,218 @@ class MLP_flow(nn.Module):
         Returns
         -------
         torch.Tensor
-            Transformed tensor according to the MLP_flow model with the shape of 'x'
+            Transformed tensor according to the MLPFlow model with the shape of 'x'
         """
         return self.net(x)
+
+
+class NormFlow(nn.Module):
+    """Normalizing flows are widley used to perform generative models.
+  This algorithm gives advantages over variational autoencoders (VAE) because
+  of ease in sampling by applying invertible transformations
+  (Frey, Gadepally, & Ramsundar, 2022).
+
+  Example
+  --------
+  >>> import deepchem as dc
+  >>> from deepchem.models.torch_models.flows import Affine, NormFlow
+  >>> import torch
+  >>> from torch.distributions import MultivariateNormal
+  >>> # initialize the transformation layer's parameters
+  >>> dim = 2
+  >>> samples = 96
+  >>> transforms = [Affine(dim)]
+  >>> distribution = MultivariateNormal(torch.zeros(dim), torch.eye(dim))
+  >>> # initialize normalizing flow model
+  >>> model = NormFlow(transforms, distribution, dim)
+  >>> # evaluate the log_prob when applying the transformation layers
+  >>> input = distribution.sample(torch.Size((samples, dim)))
+  >>> len(model.log_prob(input))
+  96
+  >>> # evaluates the the sampling method and its log_prob
+  >>> len(model.sample(samples))
+  2
+
+  """
+
+    def __init__(self, transform: Sequence, base_distribution, dim: int,
+                 **kwargs) -> None:
+        """This class considers a transformation, or a composition of transformations
+    functions (layers), between a base distribution and a target distribution.
+
+    Parameters
+    ----------
+    transform: Sequence
+      Bijective transformation/transformations which are considered the layers
+      of a Normalizing Flow model.
+    base_distribution: torch.Tensor
+      Probability distribution to initialize the algorithm. The Multivariate Normal
+      distribution is mainly used for this parameter.
+    dim: int
+      Value of the Nth dimension of the dataset.
+
+    """
+        super(NormFlow, self).__init__()
+        self.dim = dim
+        self.transforms = nn.ModuleList(transform)
+        self.base_distribution = base_distribution
+
+    def log_prob(self, inputs: torch.Tensor) -> torch.Tensor:
+        """This method computes the probability of the inputs when
+    transformation/transformations are applied.
+
+    Parameters
+    ----------
+    inputs: torch.Tensor
+      Tensor used to evaluate the log_prob computation of the learned
+      distribution.
+      shape: (samples, dim)
+
+    Returns
+    -------
+    log_prob: torch.Tensor
+      This tensor contains the value of the log probability computed.
+      shape: (samples)
+
+    """
+        log_prob = torch.zeros(inputs.shape[0])
+        for biject in reversed(self.transforms):
+            inputs, inverse_log_det_jacobian = biject.inverse(inputs)
+            log_prob += inverse_log_det_jacobian
+
+        log_prob += self.base_distribution.log_prob(inputs)
+
+        return -torch.mean(log_prob)
+
+    def sample(self, n_samples: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Performs a sampling from the transformed distribution.
+    Besides the outputs (sampling), this method returns the logarithm of
+    probability to obtain the outputs at the base distribution.
+
+    Parameters
+    ----------
+    n_samples: int
+      Number of samples to select from the transformed distribution
+
+    Returns
+    -------
+    sample: tuple
+      This tuple contains a two torch.Tensor objects. The first represents
+      a sampling of the learned distribution when transformations had been
+      applied. The secong torc.Tensor is the computation of log probabilities
+      of the transformed distribution.
+      shape: ((samples, dim), (samples))
+
+    """
+        outputs = self.base_distribution.sample((n_samples,))
+        log_prob = self.base_distribution.log_prob(outputs)
+
+        for biject in self.transforms:
+            outputs, log_det_jacobian = biject.forward(outputs)
+            log_prob += log_det_jacobian
+
+        return outputs, log_prob
+
+
+class NFlowModel(TorchModel):
+    """Normalizing Flow Model
+
+    The Normalizing Flow model is a generative model that learns a target
+    distribution by transforming a simple base distribution through a series of
+    invertible transformations.
+    The target distribution is then defined as the composition of the base distribution
+    and the flow transformations.
+    """
+
+    def __init__(self,
+                 dim: int,
+                 num_layers: int,
+                 flowList: Optional[List[Flow]] = None):
+        """Initializes the Normalizing Flow model
+
+        Parameters
+        ----------
+        dim : int
+            Dimension of the dataset
+        num_layers : int
+            Number of layers in the model
+        flowList : Optional[List[Flow]], optional
+            List of Flow layers, by default None, that can be provided
+            to the model to override the default layers
+        """
+        self.dim = dim
+        self.num_layers = num_layers
+        if flowList is not None:
+            self.flows = flowList
+        else:
+            latent_size = dim
+            self.latent_size = latent_size
+
+            b = torch.Tensor(
+                [1 if i % 2 == 0 else 0 for i in range(latent_size)])
+            flows = []
+            for i in range(num_layers):
+                s = MLPFlow([latent_size, 2 * latent_size, latent_size],
+                            init_zeros=True)
+                t = MLPFlow([latent_size, 2 * latent_size, latent_size],
+                            init_zeros=True)
+                if i % 2 == 0:
+                    flows += [MaskedAffineFlow(b, t, s)]
+                else:
+                    flows += [MaskedAffineFlow(1 - b, t, s)]
+                flows += [ActNorm(latent_size)]
+            self.distribution = MultivariateNormal(torch.zeros(dim),
+                                                   torch.eye(dim))
+            self.nfm = NormFlow(flows, self.distribution, dim)
+
+    def fit(self,
+            data: torch.Tensor,
+            epochs: int = 10,
+            learning_rate: float = 0.001,
+            weight_decay: float = 0.0001,
+            optimizer: Any = torch.optim.Adam,
+            plot: bool = False,
+            logging: bool = False) -> None:
+        """Fit the Normalizing Flow
+
+        Parameters
+        ----------
+        data : torch.Tensor
+            The dequantized dataset
+        epochs : int, optional
+            number of epochs for training, by default 10
+        learning_rate : float, optional
+            Learning rate for the optimizer, by default 0.001
+        weight_decay : float, optional
+            Weight decay for the optimizer, by default 0.0001
+        optimizer : torch.optim.Optimizer, optional
+            Optimizer for the model, by default torch.optim.Adam
+        """
+        self.loss_hist = np.array([])
+        self.optimizer = optimizer(self.nfm.parameters(),
+                                   lr=learning_rate,
+                                   weight_decay=weight_decay)
+        nfm = self.nfm
+        for epoch in tqdm(range(epochs)):
+            self.optimizer.zero_grad()  # type: ignore
+
+            # Get training samples
+            x = data
+
+            # Compute loss
+            loss = nfm.log_prob(x.to(nfm.device))
+            if ~(torch.isnan(loss) | torch.isinf(loss)):
+                loss.backward()
+                optimizer.step()
+
+            # Log loss
+            loss_hist = np.append(self.loss_hist, loss.to('cpu').data.numpy())
+            if logging:
+                print(f"Epoch: {epoch} Loss: {loss}")
+        if plot:
+            # Plot loss
+            plt.figure(figsize=(10, 10))
+            plt.plot(loss_hist, label='loss')
+            plt.legend()
+            plt.show()
+        self.nfm = nfm
